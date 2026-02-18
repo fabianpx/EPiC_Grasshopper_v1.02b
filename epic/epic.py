@@ -7,7 +7,7 @@ from collections import OrderedDict
 from math import sqrt, floor, ceil, log10, isnan
 from scriptcontext import sticky as st
 import Grasshopper.Kernel as ghKernel
-import cPickle
+import pickle # Use pickle rather than cPickle for Python 3 todo: detect if user is running IronPython
 import ghpythonlib.components as ghcomponents
 import rhinoscriptsyntax as rs
 from Grasshopper import DataTree
@@ -18,10 +18,11 @@ from System import Guid
 from System.Drawing import Color
 import os
 import random
+import Rhino.Geometry as rg
 
 __author__ = "André Stephan & Fabian Prideaux"
-__version__ = "1.02"
-__date__ = 'May, 2024'
+__version__ = "1.02b"
+__date__ = 'March, 2026'
 __message__ = 'EPiC Plugin ' + __version__ + '\n' + __date__
 epic_version = 'AU2024'
 EPIC_DATABASE_WEBSITE = 'http://www.msd.unimelb.edu.au/epic'
@@ -58,12 +59,15 @@ COLOURS = {
 
 # Generic variables used throughout
 DEFINED_FLOWS = OrderedDict()
-DEFINED_FLOWS['energy'] = {'code_name': 'energy', 'print_name': 'Energy', 'unit': 'MJ',
-                           'colour': COLOURS['orange'], 'secondary_colour': COLOURS['light_orange']}
+DEFINED_FLOWS['energy'] = {'code_name': 'energy', 'print_name': 'Energy', 'unit': 'MJ',                           'colour': COLOURS['orange'], 'secondary_colour': COLOURS['light_orange'], 'accent_colour': COLOURS['purple'],}
 DEFINED_FLOWS['water'] = {'code_name': 'water', 'print_name': 'Water', 'unit': 'L',
-                          'colour': COLOURS['teal'], 'secondary_colour': COLOURS['light_teal']}
-DEFINED_FLOWS['ghg'] = {'code_name': 'ghg', 'print_name': 'Greenhouse Gas Emissions', 'unit': 'kgCO₂e',
-                        'colour': COLOURS['yellow'], 'secondary_colour': COLOURS['light_yellow']}
+                          'colour': COLOURS['teal'], 'secondary_colour': COLOURS['light_teal'], 'accent_colour': COLOURS['purple'],}
+DEFINED_FLOWS['ghg'] = {'code_name': 'ghg', 'print_name': 'GHG', 'unit': 'kgCO₂e',
+                        'colour': COLOURS['yellow'], 'secondary_colour': COLOURS['light_yellow'], 'accent_colour': COLOURS['purple'],}
+DEFINED_FLOWS['cost'] = {'code_name': 'cost', 'print_name': 'Cost', 'unit': '$AUD',
+                        'colour': COLOURS['pink'], 'secondary_colour': COLOURS['light_pink'], 'accent_colour': COLOURS['purple'],}
+DEFINED_FLOWS['labour'] = {'code_name': 'labour', 'print_name': 'Labour', 'unit': 'Hours',
+                        'colour': COLOURS['green'], 'secondary_colour': COLOURS['light_green'], 'accent_colour': COLOURS['purple'],}
 
 HYBRID_VALUE_BREAKDOWN_DICT = {flow: {'process': None, 'io': None} for flow in DEFINED_FLOWS.keys()}
 
@@ -119,6 +123,11 @@ def version_mismatch(component_version):
             'Component version: {}'.format(__version__, component_version)
     return error
 
+
+def is_not_nan(x):
+    if isinstance(x, float):
+        return not isnan(x)
+    return True  # Consider non-float values as not NaN
 
 def check_functional_unit_and_return_formatted_version(functional_unit):
     """
@@ -814,7 +823,8 @@ class EPiCMaterial:
     FUNCTIONAL_UNIT_SEP = '|'
 
     def __init__(self, name=str, energy=float, water=float, ghg=float, functional_unit=str, doi=str, category=str,
-                 material_id=str, wastage=float, service_life=float, comments=str, density=float, process_shares=dict):
+                 material_id=str, wastage=float, service_life=float, comments=str, density=float, process_shares=dict,
+                 cost=float, labour=float):
         """
         A material class object that can be passed to EPiCAssemblies and EPiCBuiltAssets
         :param name: Name of the material
@@ -830,6 +840,8 @@ class EPiCMaterial:
         :param comments: Material comments - these will be displayed in any reports
         :param density: Material density
         :param process_shares: A dictionary with flows as keys and the process data share of the hybrid coefficient as a value
+        :param cost: Cost coefficient in price/Functional Unit
+        :param labour: Labour coefficient in hours/Functional Unit
         """
 
         self.component_type = 'EPiCMaterial'
@@ -849,6 +861,8 @@ class EPiCMaterial:
             self.id = random.getrandbits(128)
             self.comments = remove_commas_and_flatten_list_for_csv_export(comments) if comments else ''
             self.material_id = material_id
+            self.cost = cost
+            self.labour = labour
 
         except TypeError:
             raise TypeError("Couldn't load material attributes...")
@@ -1027,13 +1041,24 @@ class EPiCMaterial:
                 results.append('Service Life: {} years'.format(self.service_life))
 
         results.append('')
+
+        if self.cost > 0:
+            results.append('Cost: ${} / {}'.format(self.cost, self.functional_unit))
+
+        if self.labour > 0:
+            results.append('Labour: Hours / {}'.format(self.labour, self.functional_unit))
+
+        results.append('')
         if not custom_material:
             results.append('DOI: {}'.format(self.doi))
             results.append('')
             results.append('Process-based data proportion of hybrid value')
             for flow_properties in DEFINED_FLOWS.values():
-                results.append(flow_properties['print_name'] + ': {:.0%}'.format(
-                    self.process_shares[flow_properties['code_name']]))
+                try:
+                    results.append(flow_properties['print_name'] + ': {:.0%}'.format(
+                        self.process_shares[flow_properties['code_name']]))
+                except KeyError:
+                    pass
 
         return results if not print_to_str else '\n'.join(results)
 
@@ -1069,18 +1094,48 @@ class EPiCGraph:
                                'colour': 'secondary_colour', 'label': 'Recurrent wastage',
                                'hatch_type': 1, 'hatch_scale': 1, 'hatch_angle': 135}),
         ('life_cycle', {'flow_type': ['life_cycle', 'life_cycle_wastage'],
-                        'colour': 'colour', 'label': 'Life cycle', 'hatch_type': 0,
+                        'colour': 'colour', 'label': 'Life cycle total', 'hatch_type': 0,
                         'hatch_scale': 0.5, 'hatch_angle': 45}),
-        ('life_cycle_wastage', {'flow_type': 'life_cycle_wastage', 'colour': 'colour',
+        ('life_cycle_wastage', {'flow_type': 'life_cycle_wastage', 'colour': 'accent_colour',
                                 'label': 'Life cycle wastage', 'hatch_type': 1,
-                                'hatch_scale': 1, 'hatch_angle': 135})])
+                                'hatch_scale': 1, 'hatch_angle': 135}),
+        ('life_cycle_penalty', {'flow_type': 'life_cycle_wastage', 'colour': 'accent_colour',
+                                'label': 'Non standard wastage', 'hatch_type': 1,
+                                'hatch_scale': 1, 'hatch_angle': 100})
+    ])
 
-    def __init__(self, data, graph_origin=(0, 0, 0), graph_height=10., graph_spacing=1., graph_width=1.,
+    def __init__(self, data, graph_origin=(0, 0, 0), graph_height=8., graph_spacing=1., graph_width=1.,
                  graph_padding=6, analysis_type='by_material', graph_subset_2=None, show_recurrent=True,
                  flows=('energy', 'water', 'ghg'), sort_graph=True, graph_scale=1, column_width=0.7,
                  column_padding=0.2, space_between_graphs=5, hide_null_columns=True, minimum_spacing_for_graph=3,
                  text_size=0.3, heading_text_size=0.8, axis_label_text_size=0.65, tick_size=0.2, text_padding=0.3,
-                 legend_box_size=0.5):
+                 legend_box_size=0.5, show_legend=True, minimum_y_axis=0):
+
+        """
+        :param data: epic.EPiCBuiltAsset or epic.EPiCAssembly:
+        :param graph_origin: tuple: graph origin tuple (x,y,z)
+        :param graph_height: float: height of the final graph
+        :param graph_spacing: float: spacing of the final graph
+        :param graph_width: float: width of the final graph
+        :param graph_padding: float: general padding of the final graph
+        :param analysis_type: 'by_material', 'by_assembly", "total", or "by_assembly_and_material"
+        :param graph_subset_2:
+        :param show_recurrent: bool: displays recurrent values on graph
+        :param flows: list of strings: flow types, e.g. ['energy', 'water', 'ghg']
+        :param sort_graph: bool: whether to sort graph
+        :param graph_scale: float: scaling factor for graph
+        :param column_width: float: width of the bars
+        :param column_padding: float: padding surrounding the bars
+        :param space_between_graphs: float: spacing between graphs for each flow
+        :param hide_null_columns: bool: whether to hide null columns
+        :param minimum_spacing_for_graph: float: minimum size of the graph (important for spacing)
+        :param text_size: float: text size of the graph
+        :param heading_text_size: float: size for the heading text
+        :param axis_label_text_size: float: size for the axis label text
+        :param tick_size: float: size for the ticks
+        :param text_padding: float: padding for the text
+        :param legend_box_size: float: size of the legend box
+        """
 
         # Set all instance attributes based on inputs
         vars = locals()  # dict of local names
@@ -1236,7 +1291,9 @@ class EPiCGraph:
                                             name=flow,
                                             flow=flow,
                                             flow_units=DEFINED_FLOWS[flow]['unit'],
-                                            title=DEFINED_FLOWS[flow]['print_name'])
+                                            title=DEFINED_FLOWS[flow]['print_name'],
+                                            show_legend=self.show_legend,
+                                            minimum_y_axis=self.minimum_y_axis)
             list_of_graphs.append(epic_graph)
 
             # Move the graph_origin point for the next flow
@@ -1246,7 +1303,7 @@ class EPiCGraph:
 
     class BarGraph:
         def __init__(self, data, sub_group_data=None, graph_preferences=None, origin=Geometry.Point3d(0, 0, 0), name='',
-                     flow='', title='', flow_units=''):
+                     flow='', title='', flow_units='', show_legend=True, minimum_y_axis = 0):
             """
             A bar graph based on an EPiCAnalysis class object
             :param data: Flow data for each EPiCAnalysis input, if multiple inputs, these will be used as a comparison
@@ -1257,7 +1314,7 @@ class EPiCGraph:
             :param title: Title of the bar graph (environmental flow)
             :param flow_units: Flow units used for the bar graph
             """
-
+            self.show_legend = show_legend
             self.data = data
             self.sub_group_data = sub_group_data
             self.graph_preferences = graph_preferences
@@ -1277,7 +1334,8 @@ class EPiCGraph:
             self.origin_plane = rs.MovePlane(rs.WorldXYPlane(), self.origin)
 
             # Attributes used in graph creation process
-            self.max_data_value = 0
+
+            self.max_data_value = minimum_y_axis
             self.legend = None
             self.columns = []
             self.column_group_names = OrderedDict()
@@ -1362,7 +1420,7 @@ class EPiCGraph:
                         self.column_group_names = {'Total': {'group_label_origin': None}}
                         self.max_data_value = self._get_max_values()
 
-            # Create the column groups. Each group might multiple columns (comparison values)
+            # Create the column groups. Each group might have multiple columns (comparison values)
             for num, key in enumerate(self.column_group_names.keys()):
                 self._create_column_group(self.data, column_origin_plane, key, num, sub_group=self.sub_group_data)
 
@@ -1370,7 +1428,7 @@ class EPiCGraph:
             del self.legend
 
             # Create a legend for the graph
-            self.legend = EPiCGraph.BarGraphLegend(self, graph_preferences=self.graph_preferences)
+            self.legend = EPiCGraph.BarGraphLegend(self, graph_preferences=self.graph_preferences, show_legend=self.show_legend)
 
         def _create_column_group(self, group_data, column_origin_plane, column_group_name, column_number_in_group,
                                  sub_group=False, show_group_name=True):
@@ -1532,7 +1590,7 @@ class EPiCGraph:
             self.columns.append(graph_column)
 
         def _create_legend_attributes(self, column_group_name, column_number_in_group, column_origin_plane,
-                                      sub_group_name=False):
+                                      sub_group_name=False, show_legend=True):
             """
             Based on the column group - create attributes used to generate the graph legend.
             This includes location of break line (above group column name) for graph visualisation
@@ -1540,24 +1598,26 @@ class EPiCGraph:
             :param column_number_in_group: The column number, in the current column group 0=First
             :param column_origin_plane: Column origin plane
             """
+            if show_legend:
+                # Attributes are stored in the self.column_group_names dictionary
+                attributes = self.column_group_names[column_group_name]
 
-            # Attributes are stored in the self.column_group_names dictionary
-            attributes = self.column_group_names[column_group_name]
+                if sub_group_name:
+                    # Populate the group attributes
+                    self._populate_attributes(attributes, column_number_in_group, column_origin_plane)
 
-            if sub_group_name:
-                # Populate the group attributes
-                self._populate_attributes(attributes, column_number_in_group, column_origin_plane)
-
-                # Populate the sub-group attributes
-                _att = self.column_group_names[column_group_name]
-                if 'sub_group' not in _att:
-                    _att['sub_group'] = {}
-                if sub_group_name not in _att['sub_group']:
-                    _att['sub_group'][sub_group_name] = {}
-                attributes = _att['sub_group'][sub_group_name]
-                self._populate_attributes(attributes, column_number_in_group, column_origin_plane)
+                    # Populate the sub-group attributes
+                    _att = self.column_group_names[column_group_name]
+                    if 'sub_group' not in _att:
+                        _att['sub_group'] = {}
+                    if sub_group_name not in _att['sub_group']:
+                        _att['sub_group'][sub_group_name] = {}
+                    attributes = _att['sub_group'][sub_group_name]
+                    self._populate_attributes(attributes, column_number_in_group, column_origin_plane)
+                else:
+                    self._populate_attributes(attributes, column_number_in_group, column_origin_plane)
             else:
-                self._populate_attributes(attributes, column_number_in_group, column_origin_plane)
+                pass
 
         def _populate_attributes(self, attributes, column_number_in_group, column_origin_plane):
             """
@@ -1735,7 +1795,7 @@ class EPiCGraph:
         @staticmethod
         def make_tint(colour_tuple, tint_factor):
             """
-            Create a tint value for a a specified colour
+            Create a tint value for a specified colour
             :param colour_tuple: an aRBG colour tuple with values of 0-255 (A,R,G,B) A = alpha
             :param tint_factor: A tint factor from 0 to 1, 0 being a lighter value
             :return: (A,R,G,B) tuple
@@ -1790,13 +1850,14 @@ class EPiCGraph:
 
     class BarGraphLegend:
 
-        def __init__(self, graph, graph_preferences=None):
+        def __init__(self, graph, graph_preferences=None, show_legend=False):
             """
             Creates a legend for each graph component. This includes titles, labels, axis lines & legends.
             :param graph: BarGraph class object. Used to extract legend values.
             :param graph_preferences: Graph preference inherited from EPiCGraph
             """
 
+            self.show_legend = show_legend
             self.graph_preferences = graph_preferences
             self.graph = graph
 
@@ -1847,7 +1908,10 @@ class EPiCGraph:
                     self._create_column_group_labels(elements)
                 self._create_axis_lines(elements)
                 self._create_ticks(elements)
-                self._create_graph_title(elements, legend_top_y_axis)
+
+                if self.show_legend:
+                    self._create_graph_title(elements, legend_top_y_axis)
+
                 self._create_y_axis_labels(elements)
 
                 # Create a dictionary entry for each geometry / text that needs to be rendered
@@ -1895,7 +1959,7 @@ class EPiCGraph:
                 x_axis = self.graph.origin.X
                 y_axis = self.graph.origin.Y + self.graph_preferences.graph_height \
                          + self.graph_preferences.graph_spacing \
-                         + (self.column_spacing * num)
+                         + (self.column_spacing * num) + 3
                 z_axis = self.graph.origin.Z
                 legend_origin = rs.MovePlane(rs.WorldXYPlane(),
                                              Geometry.Point3d(x_axis, y_axis, z_axis))
@@ -1906,14 +1970,15 @@ class EPiCGraph:
                 legend_box.show_hatch = show_hatch
                 legend_box.fill_colour = legend_colour
 
-                elements['legend_boxes'].append(legend_box)
-                elements['legend_text'].append(
-                    EPiCVisualisations.bakeable_text_from_str(legend['label'],
-                                                              text_size=self.text_size,
-                                                              text_location=(
-                                                                  (legend_origin.OriginX + self.column_spacing),
-                                                                  legend_origin.OriginY,
-                                                                  legend_origin.OriginZ)))
+                if self.show_legend:
+                    elements['legend_boxes'].append(legend_box)
+                    elements['legend_text'].append(
+                        EPiCVisualisations.bakeable_text_from_str(legend['label'],
+                                                                  text_size=self.text_size,
+                                                                  text_location=(
+                                                                      (legend_origin.OriginX + self.column_spacing),
+                                                                      legend_origin.OriginY,
+                                                                      legend_origin.OriginZ)))
             return y_axis
 
         def _create_ticks(self, elements):
@@ -2089,10 +2154,13 @@ class EPiCAssembly:
 
     template_flows = OrderedDict([('initial', dict()),
                                   ('initial_wastage', dict()),
+                                  ('initial_non_standard', dict()),
                                   ('recurrent', dict()),
                                   ('recurrent_wastage', dict()),
+                                  ('recurrent_non_standard', dict()),
                                   ('life_cycle', dict()),
                                   ('life_cycle_wastage', dict()),
+                                  ('life_cycle_non_standard', dict()),
                                   ])
 
     unit_calculation = {'no.': None,
@@ -2206,7 +2274,7 @@ class EPiCAssembly:
                                                    Geometry.SubD,
                                                    Geometry.SubDFace)):
                         raise TypeError()
-                    _value = self.unit_calculation[assembly_units](geometry)[0]
+                    _value = rg.AreaMassProperties.Compute(geometry.ToBrep()).Area
 
                 elif assembly_units == 'm³':
                     # Test if this is a Brep, line or surface
@@ -2250,9 +2318,14 @@ class EPiCAssembly:
         elif self.wastage_override == 0:  # Forcing wastage to be zero
             result = [quantity * abs(m[1]) * getattr(m[0], flow) * base_quantity for m in materials_list]
         else:
-            result = [quantity * abs(m[1]) * getattr(m[0], flow) * (base_quantity + getattr(m[0], 'wastage'))
-                      for m in
-                      materials_list]
+            result = [
+                (quantity or 0) *
+                abs(m[1] or 0) *
+                (getattr(m[0], flow, 0) or 0) *
+                ((base_quantity or 0) + (getattr(m[0], 'wastage', 0) or 0))
+                for m in materials_list
+                if m and m[0] is not None
+            ]
 
         if period_of_analysis is None:
             pass
@@ -2498,7 +2571,7 @@ class EPiCAnalysis:
 
     def __init__(self, name='EPiCAnalysis', epic_assemblies=None, period_of_analysis=100,
                  graph_origin=(0, 0, 0), analysis_type='total', sort_graph=True, graph_scale=1, generate_graph=True,
-                 comments=''):
+                 comments='', flows=('energy', 'water', 'ghg')):
         """
         :param name: Name of the built_assets
         :param epic_assemblies: A single, or multiple EPiCAssembly items. These are used to calculate the assessment.
@@ -2548,10 +2621,10 @@ class EPiCAnalysis:
             if built_asset_objects:
                 self.graph_visualisations = EPiCGraph(built_asset_objects, graph_origin=graph_origin,
                                                       analysis_type=analysis_type,
-                                                      sort_graph=sort_graph, graph_scale=graph_scale)
+                                                      sort_graph=sort_graph, graph_scale=graph_scale, flows=flows)
             else:
                 self.graph_visualisations = EPiCGraph(self, graph_origin=graph_origin, analysis_type=analysis_type,
-                                                      sort_graph=sort_graph, graph_scale=graph_scale)
+                                                      sort_graph=sort_graph, graph_scale=graph_scale, flows=flows)
             self.elements_to_render = self.graph_visualisations.elements_to_render
         else:
             self.graph_visualisations = None
@@ -2560,7 +2633,7 @@ class EPiCAnalysis:
     @staticmethod
     def process_inputs(epic_inputs, analysis_type='total', graph_origin=(0, 0, 0), graph_scale=1,
                        period_of_analysis=None, report_name='EPiC Analysis',
-                       epic_assemblies_name='Assembly Collection'):
+                       epic_assemblies_name='Assembly Collection', flows=('energy', 'water', 'ghg')):
         """
         :param epic_inputs: Inputs - either EPiC_Assembly and/or EPiC_Built_Asset components
         :param analysis_type: Type of built_assets to be used for graph visualisations. 'total', 'by_material',
@@ -2600,19 +2673,19 @@ class EPiCAnalysis:
                                                    [built_asset],
                                                    period_of_analysis, graph_origin=graph_origin,
                                                    analysis_type=analysis_type, graph_scale=graph_scale,
-                                                   generate_graph=False))
+                                                   generate_graph=False, flows=flows))
         if epic_assemblies:
             _epic_analyses.append(EPiCAnalysis(epic_assemblies_name,
                                                epic_assemblies,
                                                period_of_analysis, graph_origin=graph_origin,
                                                analysis_type=analysis_type, graph_scale=graph_scale,
-                                               generate_graph=False))
+                                               generate_graph=False, flows=flows))
         if _epic_analyses:
             epic_analysis = EPiCAnalysis(report_name,
                                          _epic_analyses,
                                          period_of_analysis, graph_origin=graph_origin,
                                          analysis_type=analysis_type, graph_scale=graph_scale,
-                                         generate_graph=True)
+                                         generate_graph=True, flows=flows)
         return epic_analysis, epic_inputs
 
     # Region baking
@@ -2868,7 +2941,7 @@ class EPiCDatabase:
         if not self.database:
             if local_directory:
                 with open(local_directory + os.sep + r'EPiC Grasshopper' + os.sep + PICKLE_DB, 'rb') as f:
-                    self.database = cPickle.load(f)
+                    self.database = pickle.load(f)
 
         # Load set of categories in the database
 
@@ -2910,7 +2983,7 @@ class EPiCDatabase:
         if file_path and file_name:
             try:
                 with open(file_path + r'//' + file_name, 'rb') as f:
-                    self.custom_database = cPickle.load(f)
+                    self.custom_database = pickle.load(f)
 
                     # Overwrite categories
                     self.categories = EPiCDatabase.get_categories(self.custom_database)
@@ -2978,10 +3051,10 @@ class EPiCDatabase:
 
         # Return None if there are no results
         if not isinstance(query, list):
-            if isnan(query):
+            if not is_not_nan(query):
                 return None
             else:
                 return query
         else:
             # Remove nan values from the results and return
-            return [x if not isnan(x) else None for x in query]
+            return [x if is_not_nan(x) else None for x in query]

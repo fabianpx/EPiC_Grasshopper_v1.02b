@@ -138,7 +138,7 @@ class EPiCAnalysisComponent(component):
 
         # Component and version information
         __author__ = epic.__author__
-        __version__ = "1.02"
+        __version__ = "1.02b"
         if __version__ == epic.__version__:
             ghenv.Component.Message = epic.__message__
         else:
@@ -180,7 +180,9 @@ class EPiCAnalysisComponent(component):
                                                                           graph_scale=graph_scale,
                                                                           period_of_analysis=period_of_analysis,
                                                                           report_name=report_name,
-                                                                          epic_assemblies_name=epic_assemblies_name)
+                                                                          epic_assemblies_name=epic_assemblies_name,
+                                                                          flows=('energy','water', 'ghg')
+                                                                          )
 
             # Stop report from printing whenever component is updated (if toggle is connected).
             if 'report_exporting' not in st:

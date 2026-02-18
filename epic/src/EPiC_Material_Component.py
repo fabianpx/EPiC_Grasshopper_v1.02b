@@ -114,11 +114,14 @@ class EPiCMaterialComponent(component):
                   water_reduction,
                   ghg_reduction,
                   _null3,
+                  cost,
+                  labour,
+                  _null4,
                   epic_help):
 
         # Component and version information
         __author__ = epic.__author__
-        __version__ = "1.02"
+        __version__ = "1.02b"
         if __version__ == epic.__version__:
             ghenv.Component.Message = epic.__message__
         else:
@@ -180,10 +183,21 @@ class EPiCMaterialComponent(component):
             energy, water, ghg, functional_unit, name, doi, category, density = \
                 epic_db.query(material_id, ['Energy', 'Water', 'GHG', 'Functional Unit', 'name',
                                             'DOI', 'Category', 'Density'])
-            process_shares = {flow: epic_db.query(material_id, 'hybrid_process_proportion_' + str(flow)) for
-                              flow in epic.DEFINED_FLOWS.keys()}
+            process_shares = {}
+
+            # Test for instance where process shares are not provided
+            for flow in epic.DEFINED_FLOWS.keys():
+                try:
+                    _val = epic_db.query(material_id, 'hybrid_process_proportion_' + str(flow))
+                    process_shares[flow] = _val
+                except:
+                    pass
 
             # Only run this code if the material selection has changed. Uses global sticky to track material choice.
+            if not labour:
+                labour = 0
+            if not cost:
+                cost = 0
             if material_id != st[component_id]:
                 # Fetch the wastage/service life coefficient from the EPiCDB (if exists)
                 try:
@@ -226,7 +240,9 @@ class EPiCMaterialComponent(component):
                                                      service_life=service_life,
                                                      comments=comments,
                                                      density=density,
-                                                     process_shares=process_shares)
+                                                     process_shares=process_shares,
+                                                     cost=cost,
+                                                     labour=labour)
 
             # Component outputs
             return output_epic_material, None, output_epic_material.energy, output_epic_material.water, \
